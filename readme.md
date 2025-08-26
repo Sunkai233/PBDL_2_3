@@ -1,337 +1,360 @@
-# 监督训练
+# 翼型周围RANS流动的监督训练
 
-**Neural Surrogates and Operators**（神经替代模型 和 神经算子）
+## 目录 
 
-- Supervised Training
+- 概述
+- 公式化
+- 代码即将到来...
+- RANS训练数据
+- 网络设置
+- 训练
+- 测试评估
+- 下一步计划
 
-## 内容概述
+## 概述
 
-- 问题设定
-- 展望
+在这个监督训练的例子中，我们的目标是翼型轮廓周围的湍流气流：学习到的算子应该为给定的翼型几何形状在不同雷诺数和攻角下提供平均运动和压力分布。因此，神经网络的输入是翼型形状、雷诺数和攻角，它应该计算翼型周围具有2个分量的时间平均速度场和压力场。
 
-我们首先将针对**"纯粹"数据驱动**的方法，这与经典机器学习一致。在下文中，我们将其称为**监督方法**，以表明网络完全由数据监督，并将其与使用基于物理的损失区分开来。监督方法的一个核心优势是我们获得了一个替代模型（也称为"模拟器"或"神经算子"），即一个模拟原始函数$P $行为的新函数。
+这在经典上通过雷诺平均纳维-斯托克斯(RANS)模型来近似，这种设置仍然是工业中纳维-斯托克斯求解器最广泛使用的应用之一。然而，现在我们的目标不是依赖传统的数值方法来求解RANS方程，而是通过神经网络训练一个代理模型，完全绕过数值求解器。
 
-**纯粹数据驱动的监督训练是深度学习背景下所有项目的核心起点**。虽然与更紧密结合物理的方法相比，它可能产生次优结果，但在某些没有良好模型方程的应用场景中，它可能是唯一的选择。在本章中，我们还将介绍不同神经网络架构的基础知识。除了训练方法，这也是一个重要的选择。
+## 公式化
 
-## 问题设定
+根据监督训练的监督公式，我们的学习任务相当直接，可以写成：
 
-**对于监督训练，我们面对一个未知函数$f^* $，收集大量数据对$[x_0, y^*_0], \ldots [x_n, y^*_n] $（训练数据集），并直接训练神经网络来表示$f^* $的近似$f $。**
+$$\arg \min_\theta \sum_i (f(x_i; \theta) - y_i^*)^2$$
 
-我们以这种方式获得的**$f $通常不是精确的**，而是通过最小化问题获得：通过调整神经网络表示$f $的权重$\theta $，使得我们最小化训练集中所有数据点上的误差：
-$$
-\arg \min_\theta \sum_i (f(x_i; \theta) - y^*_i)^2 \quad (15)
-$$
-这将给我们$\theta $，使得$f(x; \theta) = y \approx y^* $在给定我们对**$f $的选择和训练选择的超参数下尽可能准确**。注意上面我们假设了最简单的$L_2 $损失情况。更一般的版本将在要通过$\arg \min_\theta \sum_i e(f(x_i; \theta), y^*_i) $最小化的损失中使用误差度量$e(x, y) $。选择合适度量的问题是我们稍后会回到的话题。上面的最小化构成了实际的"学习"过程，这是非平凡的，因为$f $通常是非线性函数。
+其中 $x$ 和 $y_i^*$ 每个都由一组物理场组成，索引 $i$ 评估我们数据集中所有离散化点的差异。
 
-**训练数据通常需要具有相当大的规模**，**因此使用数值模拟求解物理模型来产生大量可靠的输入-输出对进行训练是很有吸引力的**。****这意味着训练过程使用一组模型方程，并对它们进行数值近似，以拟合神经网络表示$f $。这有很多优势，例如，我们没有真实世界设备的测量噪声，我们不需要人工标注大量样本来获取训练数据。
+目标是推断翼型中心周围计算域 $\Omega$ 内的速度 $u = u_x, u_y$ 和压力场 $p$。$u_x, u_y, p$ 每个都具有 $128^2$ 的维度。作为输入，我们有雷诺数 $Re \in \mathbb{R}$、攻角 $\alpha \in \mathbb{R}$ 和编码为栅格化网格的翼型形状 $s \in 128^2$。$Re$ 和 $\alpha$ 根据自由流速度 $f$ 提供，其x和y分量表示为相同大小的常数场，在翼型区域包含零。因此，总的来说，输入和输出都具有相同的维度：$x, y^* \in \mathbb{R}^{3 \times 128 \times 128}$。输入包含 $[f_x, f_y, mask]$，而输出存储通道 $[p, u_x, u_y]$。这正是我们将在下面为NN指定的输入和输出维度。
 
-另一方面，这种方法继承了用模拟替代实验的常见挑战：首先，我们需要确保所选择的模型具有足够的能力来预测我们感兴趣的模拟现象的行为。此外，数值近似有数值误差，对于选定的应用需要保持足够小（否则即使是最好的神经网络也没有机会在后期提供有用的答案）。由于这些主题在经典模拟中被深入研究，现有的知识同样可以用来建立深度学习训练任务。
+这里需要记住的一点是，我们在 $y^*$ 中的感兴趣量包含三个不同的物理场。虽然两个速度分量在精神上相当相似，但压力场通常具有不同的行为，相对于速度有近似的平方缩放（参见伯努利方程）。这意味着我们需要小心简单的求和（如上面最小化问题中的），并且我们应该注意标准化数据。如果我们不注意，其中一个分量可能会占主导地位，而均值聚合会导致NN花费更多资源来学习大分量，而不是造成较小误差的其他分量。
 
-![image-20250825161302247](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20250825161302247.png)
+## 代码即将到来...
 
-## 展望
+让我们开始实现。请注意，我们将在这里跳过数据生成过程。下面的代码改编自[TWPH20]和这个代码库，您可以查看详细信息。在下面，我们将简单地使用在OpenFOAM中通过Spalart-Almaras RANS仿真生成的一小组训练数据。首先，让我们导入所需的模块，并从git安装数据加载器。
 
-**现实世界现象的PDE模型的数值近似通常计算成本很高**。另一方面，训练好的神经网络每次评估的成本是恒定的，通常在GPU或神经网络计算单元等专用硬件上评估是微不足道的。
+```python
+import os, sys, random
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
-尽管如此，重要的是要小心：神经网络可能快速生成大量的中间结果。考虑一个具有128个特征的CNN层。如果我们将其应用于$128^2 $的输入，即约16k个单元，我们得到$128^3 $个中间值。这超过了200万。所有这些值至少需要暂时存储在内存中，并由下一层处理。
-
-**尽管如此，用快速、学习的近似替换复杂和昂贵的求解器是一个非常有吸引力和有趣的方向。**
-
-在这个阶段要做的一个重要决定是选择哪种神经网络架构。
-
-------
-
-# 神经网络架构
-
-**Neural Surrogates and Operators**
-
-- Neural Network Architectures
-
-## 内容概述
-
-- 空间排列
-- 无空间排列输入
-- 局部vs全局
-- 规则、非结构化和点云数据
-- 层次结构
-- 谱方法
-- 注意力和Transformer
-- 架构总结
-- 展示一些代码！
-
-神经网络中各个"神经元"的连接性对网络的能力有重大影响。典型的神经网络由大量这些连接的"神经元"单元组成。多年来，几个关键架构已经成为特别有用的选择，在下文中我们将讨论选择架构的主要考虑因素。**我们的重点是介绍结合基于PDE的模型（"物理"）的方法，而不是神经网络架构的细节。**
-
-![image-20250825161508450](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20250825161508450.png)
-
-## 空间排列
-
-在物理模拟背景下选择架构（以及排除不合适的选项）**需要考虑的第一个基本方面是数据样本的空间排列。**我们可以区分四种主要情况：
-
-1. **无空间排列**（没有空间信息或不涉及空间信息）
-2. **网格上的规则间距（结构化）**
-3. **不规则排列（非结构化）**（图结构）****
-4. **无连接性的不规则位置（粒子/点云）**
-
-**对于某些问题，没有空间信息或排列（情况1）。例如，预测单个测量探头随温度和压力的时间演化不涉及任何空间维度**。
-
-**相反的情况是探头放置在完美对齐的网格上（情况2），或在任意位置（3）**。（研究一个结构化网络或非结构化网络的温度变化）
-
-**最后一种变体（情况4）是第三种的略微特殊情况，其中样本点之间没有清晰或持久的链接。例如，湍流流体的基于粒子的表示可能就是这种情况，其中邻域关系随时间快速变化**。
-
-## 无空间排列输入
-
-**第一种情况有些特殊：没有关于空间排列的任何信息，只有密集（"全连接"/MLP）神经网络适用。**
-
-如果您决定使用神经场方法，其中网络接收位置作为输入，这具有相同的效果：神经网络将没有任何直接手段通过架构技巧（"归纳偏置"）查询邻居。在这种情况下，下面的构建模块将不适用，值得考虑是否可以通过离散化引入更多结构。
-
-**注意，物理信息神经网络（PINNs）也属于这一类别**。我们稍后会在这里更详细地介绍（可微分物理简介），但通常建议考虑切换到采用离散化形式的先验知识的方法。这通常大幅提高推理精度并改善收敛性。PINNs尽管经过多年研究仍无法解决现实世界问题，这指出了这种方法的根本问题。
-
-专注于密集层仍然留下一些关于层数、大小和激活函数的选择。其他三种情况有相同的选择，这些架构的超参数通常在训练过程中确定。一般建议是ReLU和更平滑的变体如GELU是好选择，层数应该与其大小一起缩放。接下来，我们将重点关注下面具有空间信息的其余三种情况，因为差异在这里可能产生深远影响。所以，下面我们针对的是我们有"计算域"指定样本所在感兴趣区域的情况。
-
-# 局部 vs 全局
-
-不同架构最重要的方面可能是它们**感受野**的问题：这意味着对于我们域中的任何单个样本，其他样本点的哪个邻域可以影响该点的解。这类似于PDE求解的经典考虑，其中将PDE表示为**双曲型**表明其局部的、波浪状行为，与具有全局行为的**椭圆型**形成对比。某些神经网络架构，如经典的卷积神经网络（CNNs），只支持局部影响和感受野，而具有池化的层次结构将这些感受野扩展到有效的全局感受野。这里一个有趣的变体是像FNOs这样的谱架构，它们以牺牲其他方面为代价提供全局感受野。此外，Transformers（具有注意力机制）提供了更复杂但可扩展的替代方案。
-
-因此，可以在空间局部vs全局架构方面进行基本区分，对于后者，它们如何实现全局感受野。下表提供了第一个概述，下面我们将讨论每种变体的优缺点。
-
-![image-20250825163700039](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20250825163700039.png)
-
-## 各种神经网络详细应用场景
-
-### 1. CNN（卷积神经网络）
-
-**技术特点**：局部感受野，权重共享，平移不变性
-
-**应用场景**：
-
-- **计算机视觉**：图像分类、目标检测、图像分割
-- **医学影像**：CT扫描分析、病理图像识别、医学图像重建
-- **信号处理**：语音识别、时序信号分析
-- **物理仿真**：规则网格上的偏微分方程求解
-- **游戏AI**：围棋、象棋等棋类游戏的局面评估
-- **自然语言处理**：文本分类、情感分析（TextCNN）
-
-### 2. ResNet（残差网络）
-
-**技术特点**：跳跃连接解决梯度消失问题，支持超深网络
-
-**应用场景**：
-
-- **深度图像识别**：ImageNet分类、人脸识别
-- **视频分析**：动作识别、视频分类
-- **语音识别**：深度语音模型的骨干网络
-- **科学计算**：需要深层特征提取的物理建模
-- **自动驾驶**：环境感知、障碍物识别
-
-### 3. U-Net
-
-**技术特点**：编码器-解码器结构+跳跃连接，保持空间分辨率
-
-**应用场景**：
-
-- **医学图像分割**：器官分割、肿瘤检测、细胞分割
-- **卫星图像分析**：土地利用分类、建筑物提取
-- **材料科学**：显微镜图像的结构分析
-- **生物信息学**：蛋白质结构预测、基因序列分析
-- **图像修复**：去噪、超分辨率重建
-- **物理仿真**：流体动力学、热传导等PDE求解
-
-### 4. GNN（图神经网络）
-
-**技术特点**：处理图结构数据，消息传递机制
-
-**应用场景**：
-
-- **社交网络分析**：用户行为预测、社群发现、影响力传播
-- **推荐系统**：基于用户-物品图的协同过滤
-- **知识图谱**：实体关系推理、知识补全
-- **分子性质预测**：药物发现、材料设计
-- **交通网络**：路径规划、交通流量预测
-- **金融风控**：欺诈检测、信用评估
-- **程序分析**：代码漏洞检测、程序优化
-- **物理仿真**：分子动力学、有限元分析
-
-### 5. FNO（傅里叶神经算子）
-
-**技术特点**：频域处理，全局感受野，连续算子学习
-
-**应用场景**：
-
-- **气象预报**：全球天气模式预测
-- **海洋建模**：洋流、温度场预测
-- **地震学**：地震波传播模拟
-- **流体力学**：湍流、传热传质过程
-- **电磁学**：电磁场分布计算
-- **金融建模**：期权定价、风险评估
-- **信号处理**：频域滤波、谱分析
-
-### 6. Transformer
-
-**技术特点**：自注意力机制，并行计算，长程依赖建模
-
-**应用场景**：
-
-- 自然语言处理
-  - 机器翻译（Google Translate）
-  - 文本生成（GPT系列）
-  - 问答系统（ChatGPT、Claude）
-  - 文档理解、代码生成
-- 计算机视觉
-  - 图像分类（Vision Transformer）
-  - 目标检测（DETR）
-  - 图像生成（DALL-E）
-- 语音处理
-  - 语音识别、语音合成
-  - 音乐生成、音频分类
-- 多模态
-  - 图文理解、视频分析
-  - 跨模态检索
-- 科学计算
-  - 蛋白质折叠预测（AlphaFold2）
-  - 序列建模、时间序列预测
-- **游戏AI**：策略游戏、复杂决策
-
-> 了解数据中依赖关系的知识，即依赖关系是**局部的**还是**全局的**，是应该利用的重要知识。
->
-> 如果您的数据主要具有**局部**影响，选择支持全局感受野的架构很可能对精度产生负面影响：网络将"浪费"资源试图捕获全局效应，或最坏情况下用平滑的全局模式近似局部效应。
->
-> 反之，试图用有限的感受野近似**全局**影响将是一个无法解决的任务，很可能引入重大误差。
-
-## 规则、非结构化和点云数据
-
-**利用空间排列数据最自然的开始是使用规则网格。**(**可以不是正方形，但需要规则**)注意它不必是笛卡尔网格，而可能是变形和自适应网格[CT22]。唯一要求是样本的网格状连接性，即使它们具有不规则间距。
-
-![image-20250825161547698](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20250825161547698.png)
-
-对于非结构化数据，基于图的神经网络（GNNs）是一个好选择。虽然它们经常以消息传递操作的形式讨论，但它们与结构化网格有很多相似性：GNN上消息传递步骤的基本操作等价于网格上的卷积[SGGP+20]。层次结构同样可以通过图粗化构建[LPT25]。因此，虽然我们下面主要讨论网格，但要记住方法可以推广到GNNs。由于处理图结构使实现更复杂，我们稍后才会详细介绍。
-
-![image-20250825161554914](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20250825161554914.png)
-
-最后，点云（拉格朗日）样本可以看作没有连接性的非结构化网格。然而，为了改善学习和推理性能，明确以这种方式处理它们可能是值得的。尽管如此，卷积和层次结构这两个主要思想适用于拉格朗日数据：连续卷积核是合适的工具，基于邻域的粗化产生层次结构[PUKT22]。
-
-## 层次结构
-
-处理局部依赖关系的一个强大而自然的工具是规则网格上的卷积层。相应的神经网络（CNNs）是深度学习的经典构建模块，研究得很好，在整个过程中都得到很好的支持。它们相对容易训练，通常在APIs中实现得非常高效。**它们也提供了与经典数值的自然联系：微分算子如梯度和拉普拉斯算子的离散化通常以"模板"的形式考虑，这等价于具有一组特定权重的卷积层**。例如，考虑1D中归一化拉普拉斯算子的经典模板：$\nabla^2 [1, -2, 1] $。它可以直接映射到核大小为3、单个输入和输出通道的1D卷积。核的非可训练权重可以设置为上面拉普拉斯模板的系数。
-
-使用卷积层是非常直接的，但如何将全局依赖关系纳入CNN是一个有趣的问题。随着时间的推移，该领域已经建立了两种基本方法：**通过池化的分层网络**（U-Nets [RFB15]）和具有扩大间距的稀疏、点采样（膨胀[YK15]）。它们都达到了建立全局感受野的目标，但在内部有一些有趣的差异。
-
-![image-20250825161606997](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20250825161606997.png)
-
-- **U-Nets基于池化操作**。类似于几何多重网格层次，空间样本被下采样到越来越粗的网格，并在网络的后半部分上采样。这意味着即使我们保持卷积的核大小固定，由于先前的下采样操作，卷积将能够在物理空间方面"看"得更远。样本点的数量对数减少（$O(\log N) $），使得较低层次级别上的卷积非常高效。虽然不同的重采样方法（均值、平均、点采样...）影响较小，但**U-Net的关键成分是跳跃连接。它们通过特征串联直接连接前半部分的早期层与后半部分。这对于避免信息丢失至关重要。通常，具有最粗表示的最深"瓶颈"层难以存储最细层的所有细节。通过跳跃连接明确提供这些信息对提高精度至关重要**。
-- **膨胀**以膨胀卷积的形式将卷积的采样点放得更远。因此，例如，不是查看3x3邻域，卷积考虑5x5邻域，但在计算卷积时只包括3x3样本。所使用点之间的其他样本通常被简单忽略。与层次结构相反，样本点的数量保持恒定。
-
-## U-Net整体结构
-
-U-Net是一种对称的编码器-解码器架构，因其形状类似字母"U"而得名。它由三个主要部分组成：
-
-1. **编码器路径（Encoder/Contracting Path）** - 左侧下采样部分
-2. **瓶颈层（Bottleneck）** - 最底部的特征提取层
-3. **解码器路径（Decoder/Expansive Path）** - 右侧上采样部分
-4. **跳跃连接（Skip Connections）** - 连接对应层级的水平连接
-
-## 经典U-Net架构图
-
-```
-输入图像 (572×572×1)
-    ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                        编码器路径                                │
-│   conv 3×3, ReLU ──→ conv 3×3, ReLU                           │
-│   (572×572×64)        (570×570×64)                            │
-│             ↓                                                  │
-│   max pool 2×2 ──→ conv 3×3, ReLU ──→ conv 3×3, ReLU         │
-│   (285×285×64)     (283×283×128)      (281×281×128)           │
-│             ↓                                                  │
-│   max pool 2×2 ──→ conv 3×3, ReLU ──→ conv 3×3, ReLU         │
-│   (140×140×128)    (138×138×256)      (136×136×256)           │
-│             ↓                                                  │
-│   max pool 2×2 ──→ conv 3×3, ReLU ──→ conv 3×3, ReLU         │
-│   (68×68×256)      (66×66×512)        (64×64×512)             │
-│             ↓                                                  │
-│   max pool 2×2 ──→ conv 3×3, ReLU ──→ conv 3×3, ReLU         │──┐
-│   (32×32×512)      (30×30×1024)       (28×28×1024)            │  │
-└─────────────────────────────────────────────────────────────────┘  │
-                              ↓                                      │
-┌─────────────────────────────────────────────────────────────────┐  │
-│                        瓶颈层                                   │  │
-│                  (28×28×1024)                                  │  │
-└─────────────────────────────────────────────────────────────────┘  │
-                              ↓                                      │
-┌─────────────────────────────────────────────────────────────────┐  │
-│                        解码器路径                               │  │
-│   up-conv 2×2 ──→ concatenate ←── skip connection               │←─┘
-│   (56×56×512)     (56×56×1024)                                 │
-│             ↓                                                  │
-│   conv 3×3, ReLU ──→ conv 3×3, ReLU                           │
-│   (54×54×512)        (52×52×512)                              │
-│             ↓                                                  │
-│   up-conv 2×2 ──→ concatenate ←── skip connection              │
-│   (104×104×256)   (104×104×512)                               │
-│             ↓                                                  │
-│   conv 3×3, ReLU ──→ conv 3×3, ReLU                           │
-│   (102×102×256)      (100×100×256)                            │
-│             ↓                                                  │
-│   up-conv 2×2 ──→ concatenate ←── skip connection              │
-│   (200×200×128)   (200×200×256)                               │
-│             ↓                                                  │
-│   conv 3×3, ReLU ──→ conv 3×3, ReLU                           │
-│   (198×198×128)      (196×196×128)                            │
-│             ↓                                                  │
-│   up-conv 2×2 ──→ concatenate ←── skip connection              │
-│   (392×392×64)    (392×392×128)                               │
-│             ↓                                                  │
-│   conv 3×3, ReLU ──→ conv 3×3, ReLU                           │
-│   (390×390×64)       (388×388×64)                             │
-│             ↓                                                  │
-│   conv 1×1 ──→ 输出图像                                        │
-│   (388×388×2)                                                  │
-└─────────────────────────────────────────────────────────────────┘
+!pip install --upgrade --quiet git+https://github.com/tum-pbs/pbdl-dataset
+from pbdl.torch.loader import Dataloader
 ```
 
-这种设计使得U-Net在医学图像分割、语义分割等需要精确像素级预测的任务中表现卓越。
+下一个单元格将从HuggingFace下载训练数据，这可能需要一些时间...
 
-虽然两种方法都能达到目标并且可以表现得很好，但有一个有趣的权衡：U-Nets需要更多的实现努力，但可以快得多。性能提升的原因是膨胀卷积的次优内存访问：它们以大步幅跳过内存，这给出较慢的性能。另一方面，U-Nets基本上以粗网格的形式预计算压缩内存表示。这个粗网格上的卷积然后高效计算。然而，这需要以添加适当池化层的形式稍多的实现努力（膨胀卷积可以简单到用膨胀卷积调用替换常规卷积调用）。U-Net的实现努力可以在长期内获得显著回报，当训练好的网络应该部署在应用中时。
+```python
+BATCH_SIZE = 10
+loader_train, loader_val = Dataloader.new_split(
+    [320, 80],
+    "airfoils",
+    batch_size=BATCH_SIZE, normalize_data=None,
+)
+警告：`airfoils` 以单文件格式存储。下载可能需要一些时间...
+成功：加载了包含400个仿真和每个1个样本的airfoils。
+```
 
-如上所述，层次结构对图网络同样重要。然而，"是否膨胀"的问题对图网络不存在：这里内存访问总是不规则的，膨胀不受欢迎，因为步幅在一般图上计算成本高。因此，如果数据中存在全局依赖关系，强烈建议使用常规层次结构形式的多尺度GNN。
+下面的PBDL数据加载器调用直接将其分为320个训练样本和80个验证样本。这些验证样本使用与训练样本相同的翼型形状，但条件不同（稍后我们将下载新形状进行测试）。
 
-## 谱方法
+## RANS训练数据
 
-建立全局感受野的根本不同途径由谱方法提供，**通常利用傅里叶变换将空间数据传输到频域**。这类方法中最流行的方法是傅里叶神经算子（FNOs）[LKA+21]。一个有趣的方面是通过函数表示的连续表示的承诺，这里需要谨慎：函数空间通常被截断，因此频率表示是否真的产生超出训练数据分辨率的合适解是经常有问题的。
+现在我们有了训练和验证数据。一般来说，尽可能多地理解我们正在使用的数据非常重要（对于任何ML任务，垃圾进垃圾出的原则绝对成立）。我们至少应该在维度和粗略统计方面理解数据，但理想情况下也应该在内容方面理解数据。否则，我们将很难解释训练运行的结果。尽管有所有AI魔法：如果你无法在数据中找出任何模式，神经网络很可能也不会找到任何有用的模式。
 
-然而，在下文中，我们将重点关注感受野与性能方面的结合。这里，FNO类方法有一个有趣的行为：它们用密集层修改频率信息。由于傅里叶变换后的频率信号与输入大小相同，密集层工作在最大频率的子集上。对于二维输入，这意味着$M $模，相应的密集层因此需要$M^4 $参数。
+因此，让我们看一下其中一个训练样本。以下只是一些帮助代码来并排显示图像。
 
-频域的固有优势和结果是所有基函数都有全局支持。这意味着尽管只处理所有频率的子集，FNOs可以处理（和修改）输入信号的所有部分。这种全局依赖关系的自然处理是谱方法的固有优势。
+```python
+def plot(a1, a2, mask=None, stats=False, bottom="NN Output", top="Reference", title=None):
+    c = []
+    if mask is not None: mask = np.asarray(mask)
+    for i in range(3):
+        a2i = np.asarray(a2[i])
+        if mask is not None: a2i = a2i - mask*a2i  # 可选地遮盖内部区域
+        b = np.flipud(np.concatenate((a2i, a1[i]), axis=1).transpose())
+        min, mean, max = np.min(b), np.mean(b), np.max(b)
+        if stats:
+            print("Stats %d: " % i + format([min, mean, max]))
+        b -= min
+        b /= max - min
+        c.append(b)
+    fig, axes = plt.subplots(1, 1, figsize=(16, 5))
+    axes.set_xticks([]) ; axes.set_yticks([])
+    im = axes.imshow(np.concatenate(c, axis=1), origin="upper", cmap="magma")
+    fig.colorbar(im, ax=axes)
+    axes.set_xlabel("p, ux, uy")
+    axes.set_ylabel("%s %s" % (bottom, top))
+    if title is not None: plt.title(title)
+    plt.show()
 
-![image-20250825161622700](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20250825161622700.png)
+inputs, targets = next(iter(loader_train))
+plot(inputs[0], targets[0], stats=False, bottom="Target Output", top="Inputs", title="Training sample")
+```
 
-**不幸的是，它们不适合高维问题**：从二维移动到三维将要处理的频率大小增加到$M^3 $。对于密集层，这意味着$M^6 $参数，三次增加。对于卷积，2D中没有巨大差异：核大小为$K $的常规卷积在2D中需要$K^2 $权重，并引发处理特征的另一个$O(K^2) $缩放，对于大小为$N^2 $的域总计$O(K^4 N^2) $。然而，由于$K \ll N $，常规卷积在3D中缩放得更好：核大小增加到$K^3 $，对于边长为$N $的3D域给出总体复杂度$O(K^5 N^3) $。
+![image-20250825212843867](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20250825212843867.png)
 
-FNOs的频率覆盖需要随空间域大小缩放，因此通常$M > K $和$M^6 \gg K^5 $。因此，由于$K $通常远小于$M $和$N $，并且以5次方缩放，CNN通常比具有6次方缩放的FNOs缩放得更好。**它们需要难以处理的参数量来捕获更精细的特征，因此不推荐用于3D（或更高维）问题。基于CNN的架构需要更少的权重，结合层次结构仍然可以高效处理全局依赖关系。**
+## 网络设置
 
-## 注意力和Transformer
+现在我们可以设置神经网络的架构，我们将使用一个完全卷积的U-net。这是一个广泛使用的架构，它在不同的空间分辨率上使用一堆卷积。与常规卷积网络的主要偏差是层次结构（用于全局感受野），以及引入从编码器到解码器部分的跳跃连接。这确保在特征提取过程中不会丢失信息。（请注意，这只在网络要作为一个整体使用时才有效。在我们例如希望将解码器作为独立组件使用的情况下，它不起作用。）
 
-深度学习领域的一个较新且令人兴奋的发展是注意力机制。它们以Transformer的形式在处理语言和自然图像方面取得了巨大成功，并对物理相关问题具有希望。然而，**它们是否真的通常优于更"经典"的架构仍然是开放的**。以下部分将概述主要的优缺点。
+这是架构的概述：
 
-Transformer通常分两步工作：输入用编码器-解码器网络编码为标记。这一步可以采取多种形式，通常主要用于减少输入数量，例如，处理图像片段而不是单个像素。然后注意力机制计算传入标记集合的权重。这是每个标记的浮点数，传统上解释为指示输入的哪些部分重要，哪些不重要。在现代架构中，注意力的浮点权重直接用于修改输入。在自注意力中，权重从每个输入向所有其他输入标记计算。这是处理全局依赖关系的机制，因此直接适合上面的讨论。在实践中，注意力通过三个矩阵计算：查询$Q $、键矩阵$K $和值矩阵$V $。对于$N $个标记，外积$QK^T $产生$N \times N $矩阵，经过Softmax层，然后与$V $（包含输入标记的线性投影）相乘以产生注意力输出向量。
+![image-20250825212904450](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20250825212904450.png)
 
-在Transformer架构中，注意力输出用作构建模块的组件：计算注意力并用作残差（添加到输入），用层归一化稳定，然后在两层前馈网络（FFN）中处理。后者简单地是两个密集层与中间激活的组合。这个Transformer块，如下面可视化总结，在最终输出解码到原始空间之前应用多次。
+首先，我们将定义一个辅助函数来设置网络中的卷积块，`blockUNet`。请注意，我们不使用任何池化！相反，我们使用步幅和转置卷积（这些需要对解码器部分对称，即具有奇数核大小），遵循最佳实践。
 
-![image-20250825161638495](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20250825161638495.png)
+完整的PyTorch神经网络通过`DfpNet`类管理。
 
-**这种Transformer架构被证明可以很好地扩展到具有大量参数的网络**，这是Transformer的关键优势之一。注意大部分权重通常最终在注意力的矩阵中，而不仅仅在密集层中。同时，注意力提供了处理输入中全局依赖关系的强大方式。这以更复杂的架构为代价。上面自注意力机制的固有问题是它在标记数量$N $上是二次的。这自然对输入的大小和分辨率设置了限制。在内部，它也出奇地简单：注意力算法计算$N \times N $矩阵，这与应用简单密集层（这同样带有$N \times N $权重矩阵）来解决全局影响相去不远。
+```python
+def blockUNet(in_c, out_c, name, size=4, pad=1, transposed=False, bn=True, activation=True, relu=False, dropout=0.):
+    block = nn.Sequential()
+    if not transposed:
+        block.add_module(
+            "%s_conv" % name,
+            nn.Conv2d(in_c, out_c, kernel_size=size, stride=2, padding=pad, bias=True)
+        )
+    else:
+        block.add_module(
+            "%s_upsam" % name, nn.Upsample(scale_factor=2, mode="bilinear")
+        )
+        # 为上采样（即解码器部分）减少一个核大小
+        block.add_module(
+            "%s_tconv" % name,
+            nn.Conv2d(in_c, out_c, kernel_size=(size - 1), stride=1, padding=pad, bias=True)
+        )
+    if bn:
+        block.add_module("%s_bn" % name, nn.BatchNorm2d(out_c))
+    if dropout > 0.0:
+        block.add_module("%s_dropout" % name, nn.Dropout2d(dropout, inplace=True))
+    if activation:
+        if relu:
+            block.add_module("%s_relu" % name, nn.ReLU(inplace=True))
+        else:
+            block.add_module("%s_leakyrelu" % name, nn.LeakyReLU(0.2, inplace=True))
+    return block
 
-这个瓶颈可以用线性注意力解决：它改变上面的算法，先将$Q $和$K^T V $相乘（$N \times N $），对两部分预先应用非线性（例如指数）。这避免了$N \times N $矩阵并在$N $上线性缩放。然而，这种改进以更近似的注意力向量为代价。
+class DfpNet(nn.Module):
+    def __init__(self, channelExponent=6, dropout=0.0):
+        super(DfpNet, self).__init__()
+        channels = int(2**channelExponent + 0.5)
+        self.layer1 = blockUNet(3, channels * 1, "enc_layer1", transposed=False, bn=False, relu=False, dropout=dropout)
+        self.layer2 = blockUNet(channels, channels * 2, "enc_layer2", transposed=False, bn=True, relu=False, dropout=dropout)
+        self.layer3 = blockUNet(channels * 2, channels * 2, "enc_layer3", transposed=False, bn=True, relu=False, dropout=dropout)
+        self.layer4 = blockUNet(channels * 2, channels * 4, "enc_layer4", transposed=False, bn=True, relu=False, dropout=dropout)
+        self.layer5 = blockUNet(channels * 4, channels * 8, "enc_layer5", transposed=False, bn=True, relu=False, dropout=dropout)
+        self.layer6 = blockUNet(channels * 8, channels * 8, "enc_layer6", transposed=False, bn=True, relu=False, dropout=dropout)
+        self.layer7 = blockUNet(channels * 8, channels * 8, "enc_layer7", transposed=False, bn=True, relu=False, dropout=dropout)
+        
+        # 注意，内核大小在解码器部分内部减少一个
+        self.dlayer7 = blockUNet(channels * 8, channels * 8, "dec_layer7", transposed=True, bn=True, relu=True, dropout=dropout)
+        self.dlayer6 = blockUNet(channels * 16, channels * 8, "dec_layer6", transposed=True, bn=True, relu=True, dropout=dropout)
+        self.dlayer5 = blockUNet(channels * 16, channels * 4, "dec_layer5", transposed=True, bn=True, relu=True, dropout=dropout)
+        self.dlayer4 = blockUNet(channels * 8, channels * 2, "dec_layer4", transposed=True, bn=True, relu=True, dropout=dropout)
+        self.dlayer3 = blockUNet(channels * 4, channels * 2, "dec_layer3", transposed=True, bn=True, relu=True, dropout=dropout)
+        self.dlayer2 = blockUNet(channels * 4, channels, "dec_layer2", transposed=True, bn=True, relu=True, dropout=dropout)
+        self.dlayer1 = blockUNet(channels * 2, 3, "dec_layer1", transposed=True, bn=False, activation=False, dropout=dropout)
 
-Transformer架构的一个有趣方面是它们**已被应用于结构化和非结构化输入**。**即，它们已被用于图、点以及基于网格的数据。在所有情况下，差异主要在于输入如何映射到标记**。注**意力通常在标记空间中仍然是"密集的"。（计算复杂度高）这是一个明显的限制**：对于具有已知空间结构的问题，丢弃这些信息将不可避免地需要补偿，例如，用更大的权重计数或更低的推理精度。
+    def forward(self, input):
+        # 注意，这个Unet堆栈当然可以用循环来分配...
+        out1 = self.layer1(input)
+        out2 = self.layer2(out1)
+        out3 = self.layer3(out2)
+        out4 = self.layer4(out3)
+        out5 = self.layer5(out4)
+        out6 = self.layer6(out5)
+        out7 = self.layer7(out6)
+        # ... 瓶颈 ...
+        dout6 = self.dlayer7(out7)
+        dout6_out6 = torch.cat([dout6, out6], 1)
+        dout6 = self.dlayer6(dout6_out6)
+        dout6_out5 = torch.cat([dout6, out5], 1)
+        dout5 = self.dlayer5(dout6_out5)
+        dout5_out4 = torch.cat([dout5, out4], 1)
+        dout4 = self.dlayer4(dout5_out4)
+        dout4_out3 = torch.cat([dout4, out3], 1)
+        dout3 = self.dlayer3(dout4_out3)
+        dout3_out2 = torch.cat([dout3, out2], 1)
+        dout2 = self.dlayer2(dout3_out2)
+        dout2_out1 = torch.cat([dout2, out1], 1)
+        dout1 = self.dlayer1(dout2_out1)
+        return dout1
+```
 
-尽管如此，**Transformer是深度学习中一个极其活跃的领域，显然是未来神经网络算法的潜在竞争者。**
+接下来，我们可以初始化`DfpNet`的实例。
 
-## 架构总结
+```python
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find("Conv") != -1:
+        m.weight.data.normal_(0.0, 0.02)
+    elif classname.find("BatchNorm") != -1:
+        m.weight.data.normal_(1.0, 0.02)
+        m.bias.data.fill_(0)
+```
 
-以上段落概述了为物理相关问题选择神经网络架构的几个基本考虑。总结一下，**选择架构时的主要考虑是关于数据中局部或全局依赖关系的知识**。根据这种差异定制架构可以产生很大影响。**虽然数据的空间结构似乎决定选择，但考虑将数据转移到另一个数据结构可能是值得的**。例如，将非结构化点投影到（变形的）规则网格上，以潜在地提高精度和性能。
+在下面，这里的`EXPO`参数控制我们Unet特征图的指数：这直接缩放网络大小（指数为4给出一个约58.5万参数的网络）。对于具有$3 \times 128^2 =$ 约4.9万输出的生成NN，这是一个中等大小的网络，仍然产生快速的训练时间。因此这是一个好的起点。`weights_init`函数将卷积网络初始化为合理的初始值范围，这样我们可以直接用固定的学习率训练（否则强烈推荐学习率调度）。
 
-此外，应该提到上述典型架构的混合存在：例如，具有跳跃连接的经典U-Net已配备Transformer架构的组件（如注意力和归一化）以产生改进的性能。这种"现代化"U-Net的实现可以在基于扩散的时间预测中找到。
+```python
+# 通道指数来控制网络大小
+EXPO = 4
+torch.set_default_device("cuda:0")
+device = torch.get_default_device()
+net = DfpNet(channelExponent=EXPO)
+net.apply(weights_init)
 
-## 展示一些代码！
+# 需要关注的关键参数：我们有多少参数？
+nn_parameters = filter(lambda p: p.requires_grad, net.parameters())
+print("可训练参数：{} -> 关键！始终保持关注...".format(sum([np.prod(p.size()) for p in nn_parameters])))
 
-最后让我们看一个训练神经网络的代码示例：我们将用来自[TWPH20]的代理模型替换翼型周围湍流的完整求解器，使用具有全局感受野的U-Net作为算子。
+LR = 0.0002  # 学习率
+loss = nn.L1Loss()
+optimizer = optim.Adam(net.parameters(), lr=LR, betas=(0.5, 0.999), weight_decay=0.)
+可训练参数：585027 -> 关键！始终保持关注...
+```
+
+正如打印语句中的微妙提示所示，参数计数是训练神经网络时需要关注的关键数字。很容易更改设置，得到一个有数百万参数的网络，结果可能导致训练时间的浪费（以及潜在的训练不稳定性）。参数数量绝对必须与训练数据量匹配，也应该与网络深度成比例。这三者如何相互关联是问题相关的。
+
+## 训练
+
+最后，我们可以训练神经网络。这一步可能需要一段时间，因为训练要遍历所有320个样本100次，并持续评估验证样本以跟踪当前神经网络状态的性能。
+
+```python
+EPOCHS = 200  # 训练轮数
+loss_hist = []
+loss_hist_val = []
+
+if os.path.isfile("dfpnet"):  # NT_DEBUG
+    print("发现现有网络，加载并跳过训练")
+    net.load_state_dict(torch.load("dfpnet"))
+else:
+    print("从头开始训练...")
+    pbar = tqdm(initial=0, total=EPOCHS, ncols=96)
+    for epoch in range(EPOCHS):
+        # 训练
+        net.train()
+        loss_acc = 0
+        for i, (inputs, targets) in enumerate(loader_train):
+            inputs = inputs.float()
+            targets = targets.float()
+            net.zero_grad()
+            outputs = net(inputs)
+            lossL1 = loss(outputs, targets)
+            lossL1.backward()
+            optimizer.step()
+            loss_acc += lossL1.item()
+        loss_hist.append(loss_acc / len(loader_train))
+        
+        # 评估验证样本
+        net.eval()
+        loss_acc_v = 0
+        with torch.no_grad():
+            for i, (inputs, targets) in enumerate(loader_val):
+                inputs = inputs.float()
+                targets = targets.float()
+                outputs = net(inputs)
+                loss_acc_v += loss(outputs, targets).item()
+        loss_hist_val.append(loss_acc_v / len(loader_val))
+        
+        pbar.set_description("训练损失：{:7.5f}，验证损失：{:7.5f}".format(loss_hist[-1], loss_hist_val[-1]))
+        pbar.update(1)
+    
+    torch.save(net.state_dict(), "dfpnet")
+    print("训练完成，保存网络权重")
+
+loss_hist = np.asarray(loss_hist)
+loss_hist_val = np.asarray(loss_hist_val)
+从头开始训练...
+训练损失：0.01113，验证损失：0.01996：100%|█████████████████| 200/200 [05:40<00:00, 1.70s/it]
+训练完成，保存网络权重
+```
+
+神经网络已训练完成，损失应该在绝对值方面有所下降：使用标准设置，验证损失从大约0.2的初始值降到训练后的约0.02。
+
+让我们看看图表，以了解训练如何随时间进展。这通常对于识别训练中的长期趋势很重要。在实践中，很难从命令行日志中100个左右的嘈杂数字中发现整体趋势是否略微上升或下降——这在可视化中更容易发现。
+
+您应该看到一条在约40个轮次下降的曲线，然后开始变平。在最后部分，它仍在缓慢下降，最重要的是，验证损失没有增加。这将是过拟合的确定迹象，是我们应该避免的。
+
+```python
+plt.plot(np.arange(loss_hist.shape[0]), loss_hist, "b", label="训练损失")
+plt.plot(np.arange(loss_hist_val.shape[0]), loss_hist_val, "g", label="验证损失")
+plt.legend()
+plt.show()
+```
+
+![image-20250825212940609](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20250825212940609.png)
+
+（尝试人为地减少训练数据量，然后您应该能够故意导致过拟合。）
+
+请注意上面的验证损失通常较高，因为这里的数据集相对较小。在某些时候，网络将无法从中获得转移到验证样本的新信息。
+
+这里有一个一般性的警告：永远不要用训练数据评估你的网络。那不会告诉你太多，因为过拟合是一个非常常见的问题。至少使用网络之前没有见过的数据，即验证数据，如果看起来不错，尝试一些更不同（至少稍微超出分布）的输入，即测试数据。下一个单元格在验证数据的一批样本上运行训练好的网络，并使用plot函数显示一个。
+
+这里显示了输入和网络输出之间的良好相似性。翼型周围的区域通常仍然有点嘈杂（这是由狄利克雷边界引起的，可以通过修改损失和更大的网络来缓解）。压力值通常是最难学习的。不过，我们将把更详细的评估留给测试数据。
+
+```python
+net.eval()
+inputs, targets = next(iter(loader_val))
+inputs = inputs.float()
+targets = targets.float()
+outputs = net(inputs)
+outputs = outputs.data.cpu().numpy()
+inputs = inputs.cpu()
+targets = targets.cpu()
+plot(targets[0], outputs[0], mask=inputs[0][2], title="验证样本")
+```
+
+![image-20250825213015147](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20250825213015147.png)
+
+## 测试评估
+
+现在让我们看看实际的测试样本：在这种情况下，我们将使用新的翼型形状作为分布外(OOD)数据。这些是网络在任何训练样本中都没有见过的形状，因此它告诉我们神经网络对未见输入的泛化能力（验证数据不足以得出关于泛化的结论）。
+
+我们将使用与之前相同的可视化，正如伯努利方程所示，特别是第一列中的压力对网络来说是一个具有挑战性的量。由于它相对于输入自由流速度的三次缩放和局部峰值，它是网络推断的最困难量。
+
+下面的单元格首先下载一个包含这些测试数据样本的较小归档文件，然后通过网络运行它们。评估循环还计算累积的L1误差，这样我们就可以量化网络在测试样本上的表现。
+
+```python
+loader_test = Dataloader("airfoils-test", batch_size=1, normalize_data=None, shuffle=False)
+
+loss = nn.L1Loss()
+net.eval()
+L1t_accum = 0.
+for i, testdata in enumerate(loader_test, 0):
+    inputs_curr, targets_curr = testdata
+    inputs = inputs_curr.float()
+    targets = targets_curr.float()
+    outputs = net(inputs)
+
+    outputs_curr = outputs.data.cpu().numpy()
+    inputs_curr = inputs_curr.cpu()
+    targets_curr = targets_curr.cpu()
+
+    L1t_accum += loss(outputs, targets).item()
+    if i<3: plot(targets_curr[0], outputs_curr[0], mask=inputs_curr[0][2], title="测试样本 %d" % i)
+
+print("\n平均相对测试误差：{}".format(L1t_accum/len(loader_test)))
+警告：`airfoils-test` 以单文件格式存储。下载可能需要一些时间...
+成功：加载了包含10个仿真和每个1个样本的airfoils-test。
+
+平均相对测试误差：0.026288176793605088
+```
+
+![image-20250825213032501](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20250825213032501.png)
+
+使用默认设置的平均测试误差应该接近0.025。由于输入已标准化，这意味着所有三个场的平均相对误差相对于每个量的最大值约为2.5%。对于新形状来说这还不错，但显然还有改进空间。
+
+查看可视化，您会注意到特别是高压峰值和更大y速度的区域在输出中缺失。这主要是由小网络造成的，它没有足够的资源来重建细节。$L_2$损失也有平均行为，倾向于较大的结构（周围环境）而不是局部峰值。
+
+尽管如此，我们已经成功地用一个小而快的神经网络架构替换了一个相当复杂的RANS求解器。它具有"开箱即用"的GPU支持（通过pytorch），是可微分的，并且只引入了几个百分点的误差。通过额外的更改和更多数据，这个设置可以变得高度准确[CT22]。
+
+## 下一步计划
+
+这里有许多显而易见的尝试（见下面的建议），例如更长的训练、更大的数据集、更大的网络等。
+
+- 实验学习率、dropout和网络大小以减少测试集上的误差。给定训练数据，你能让它变得多小？
+- 上面的设置使用标准化数据。相反，您可以通过撤销标准化来恢复原始场，以检查网络相对于原始量的表现。
+
+正如您将看到的，您可以从这个数据集中得到的东西有点有限，前往此项目的主github仓库下载更大的数据集，或生成自己的数据。
